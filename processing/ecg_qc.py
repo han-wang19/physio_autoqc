@@ -1,13 +1,73 @@
 """ECG窗口级自动QC、连续区间选择和可视化。"""
+from processing.common import output_path
+
+from processing.common import csv_path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import neurokit2 as nk
 import numpy as np
+from scipy.stats import kurtosis
 
 import project_config as cfg
-from common import longest_true_interval, plot_dir, save_figure, signal_dir, window_starts, write_csv
+from processing.common import (
+    longest_true_interval, plot_dir, plot_indices, save_figure,
+    signal_dir, window_starts, write_csv,
+)
+from reports.qc_coverage import save_qc_coverage_plot
+
+
+def _zhao_zhang_sqi(ecg, peaks, sfreq):
+    """Compute the three-index Zhao-Zhang SQI heuristic used by NeuroKit.
+
+    Band powers are integrated from one shared Welch PSD. Baseline power is
+    expressed relative to total 0-40 Hz power, so the ratio is invariant to
+    the ECG amplitude unit. The paper's kurtosis definition is Pearson's
+    (normal distribution = 3), not Fisher excess kurtosis.
+    """
+    segment = np.asarray(ecg, dtype=float)
+    segment = segment[np.isfinite(segment)]
+    if segment.size < 4 or not np.any(segment):
+        return "Unacceptable"
+    frequencies, psd = nk.signal_psd(
+        segment, sampling_rate=sfreq, method="welch", normalize=False,
+        min_frequency=0, max_frequency=40, window=1024,
+    )[["Frequency", "Power"]].to_numpy().T
+    bands = ((5, 15), (5, 40), (0, 1), (0, 40))
+    power = []
+    for low, high in bands:
+        mask = (frequencies >= low) & (frequencies <= high)
+        power.append(float(np.trapz(psd[mask], frequencies[mask])) if mask.sum() > 1 else 0.0)
+    p_qrs, p_total_band, p_baseline, p_total = power
+    p_sqi = p_qrs / p_total_band if p_total_band > 0 else 0.0
+    bas_sqi = 1.0 - p_baseline / p_total if p_total > 0 else 0.0
+    k_sqi = float(kurtosis(segment, fisher=False, bias=False))
+
+    rr = np.diff(np.asarray(peaks, dtype=float)) / sfreq
+    max_bpm = float(np.max(60.0 / rr)) if rr.size and np.all(rr > 0) else 0.0
+    if max_bpm < 130:
+        p_optimal = 0.5 < p_sqi < 0.8
+        p_suspicious = 0.4 < p_sqi <= 0.5
+    else:
+        p_optimal = 0.4 < p_sqi < 0.7
+        p_suspicious = 0.3 < p_sqi <= 0.4
+    categories = [
+        "optimal" if p_optimal else "suspicious" if p_suspicious else "unqualified",
+        "optimal" if k_sqi > 5 else "unqualified",
+        "optimal" if bas_sqi >= 0.95 else "suspicious" if bas_sqi >= 0.90 else "unqualified",
+    ]
+    unqualified = categories.count("unqualified")
+    suspicious = categories.count("suspicious")
+    optimal = categories.count("optimal")
+    if unqualified >= 2 or (unqualified == 1 and suspicious == 2):
+        return "Unacceptable"
+    if optimal >= 2 and unqualified == 0:
+        return "Excellent"
+    return "Barely acceptable"
 
 
 def _template_correlation(ecg, peaks, sfreq):
+    """返回各心搏与中位 QRS 模板相关系数的中位数。"""
     before = int(round(0.20 * sfreq))
     after = int(round(0.40 * sfreq))
     beats = []
@@ -31,6 +91,7 @@ def _template_correlation(ecg, peaks, sfreq):
 
 
 def _rr_metrics(peaks, sfreq):
+    """计算合理心率 RR 比例和局部 RR 异常比例。"""
     if len(peaks) < 3:
         return 0.0, 1.0
     rr = np.diff(peaks) / sfreq
@@ -106,6 +167,7 @@ def _rr_artifact_summary(peaks, sfreq):
 
 
 def _window_artifacts(summary, start, end, total_rr):
+    """提取与当前窗口重叠的 RR 坏段及短异常比例。"""
     overlapping = [
         run for run in summary["runs"]
         if run["end_s"] > start and run["start_s"] < end
@@ -117,8 +179,9 @@ def _window_artifacts(summary, start, end, total_rr):
 
 def _window_status(
     signal_sd, peak_count, expected_min_peaks, rr_fraction, rr_outlier,
-    has_uncorrectable_run, short_correction_fraction,
+    has_uncorrectable_run, short_correction_fraction, signal_quality,
 ):
+    """按严重程度优先级判定单个 ECG 窗口。"""
     if not np.isfinite(signal_sd) or signal_sd <= cfg.ECG_MIN_SIGNAL_SD:
         return "FAIL", "FLAT_SIGNAL"
     if peak_count < expected_min_peaks:
@@ -127,14 +190,19 @@ def _window_status(
         return "FAIL", "UNCORRECTABLE_RR_RUN"
     if rr_fraction < cfg.ECG_FAIL_RR_FRACTION or rr_outlier > cfg.ECG_FAIL_RR_OUTLIER_FRACTION:
         return "FAIL", "IMPLAUSIBLE_RR"
+    if signal_quality == "Unacceptable":
+        return "FAIL", "UNACCEPTABLE_SIGNAL_QUALITY"
     if short_correction_fraction > cfg.ECG_MAX_SHORT_RR_CORRECTION_FRACTION:
         return "REVIEW", "EXCESSIVE_RR_CORRECTION"
     if rr_fraction < cfg.ECG_PASS_RR_FRACTION or rr_outlier > cfg.ECG_PASS_RR_OUTLIER_FRACTION:
         return "REVIEW", "BORDERLINE_RR"
+    if signal_quality != "Excellent":
+        return "REVIEW", "BORDERLINE_SIGNAL_QUALITY"
     return "PASS", ""
 
 
 def evaluate_windows(data, rid):
+    """滑窗计算一条 ECG 记录的指标、状态和 RR 坏段。"""
     ecg = data["filtered"]
     primary = data["primary_peaks"]
     initial = data["initial_peaks"]
@@ -151,6 +219,7 @@ def evaluate_windows(data, rid):
         raw_p = initial[(initial >= left) & (initial < right)] - left
         signal_sd = float(np.nanstd(segment))
         template = _template_correlation(segment, p, sfreq)
+        signal_quality = _zhao_zhang_sqi(segment, p, sfreq)
         rr_fraction, rr_outlier = _rr_metrics(p, sfreq)
         window_duration = max(0.0, end - start)
         expected_min_peaks = max(3, int(np.floor(window_duration * cfg.ECG_PLAUSIBLE_HR_BPM[0] / 60.0)) - 1)
@@ -159,13 +228,14 @@ def evaluate_windows(data, rid):
         )
         status, reason = _window_status(
             signal_sd, len(p), expected_min_peaks, rr_fraction, rr_outlier,
-            uncorrectable, correction_fraction,
+            uncorrectable, correction_fraction, signal_quality,
         )
         rows.append({
             "record_id": rid, "start_s": start, "end_s": end, "status": status,
             "reason": reason, "ecg_sd": signal_sd, "rpeaks": len(p),
             "minimum_expected_rpeaks": expected_min_peaks,
             "template_correlation": template, "rr_plausible_fraction": rr_fraction,
+            "signal_quality": signal_quality,
             "rr_outlier_fraction": rr_outlier,
             "short_rr_correction_fraction": correction_fraction,
             "uncorrectable_rr_run": uncorrectable,
@@ -174,30 +244,86 @@ def evaluate_windows(data, rid):
     return rows, artifact_summary
 
 
-def _qc_timeline(rows, rid):
-    colors = {"PASS": "#22c55e", "REVIEW": "#f59e0b", "FAIL": "#ef4444"}
-    fig, axes = plt.subplots(4, 1, figsize=(18, 10), sharex=True)
-    starts = np.array([row["start_s"] for row in rows])
-    axes[0].bar(starts, 1, width=cfg.QC_STEP_SECONDS, align="edge", color=[colors[row["status"]] for row in rows])
-    axes[0].set(title="{} | ECG window QC".format(rid), ylabel="Status", yticks=[])
-    axes[1].plot(starts, [row["rr_plausible_fraction"] for row in rows], "o-", markersize=3)
-    axes[1].axhline(cfg.ECG_PASS_RR_FRACTION, color="#22c55e", linestyle="--")
-    axes[1].axhline(cfg.ECG_FAIL_RR_FRACTION, color="#ef4444", linestyle="--")
-    axes[1].set(ylabel="RR plausible", ylim=(0, 1.05))
-    axes[2].plot(starts, [row["rr_outlier_fraction"] for row in rows], "o-", markersize=3)
-    axes[2].axhline(cfg.ECG_PASS_RR_OUTLIER_FRACTION, color="#22c55e", linestyle="--")
-    axes[2].axhline(cfg.ECG_FAIL_RR_OUTLIER_FRACTION, color="#ef4444", linestyle="--")
-    axes[2].set(ylabel="RR outliers", ylim=(-0.01, 1.0))
-    axes[3].plot(starts, [row["short_rr_correction_fraction"] for row in rows], "o-", markersize=3)
-    axes[3].axhline(cfg.ECG_MAX_SHORT_RR_CORRECTION_FRACTION, color="#f59e0b", linestyle="--")
-    axes[3].set(xlabel="Window start (s)", ylabel="RR corrected", ylim=(-0.01, 1.0))
+def _shade_bad_runs(ax, runs):
+    """用橙色标出短异常、红色标出不可修正坏段。"""
+    labels_used = set()
+    for run in runs:
+        if run["correctable"]:
+            color, label = "#f59e0b", "Correctable short RR run"
+        else:
+            color, label = "#ef4444", "Uncorrectable RR run"
+        ax.axvspan(
+            run["start_s"], run["end_s"], color=color, alpha=0.22,
+            label=label if label not in labels_used else None,
+        )
+        labels_used.add(label)
+
+
+def _qc_plot(data, rows, artifact_summary, rid, effective=False):
+    """绘制可直接人工复核的 ECG、R 峰、坏段、心率和窗口状态。"""
+    ecg = data["filtered"]
+    peaks = data["primary_peaks"]
+    sfreq = float(data["sfreq"])
+    time = np.arange(ecg.size) / sfreq
+    peak_time = peaks / sfreq
+    view = plot_indices(ecg.size)
+
+    heart_rate = 60.0 / (np.diff(peaks) / sfreq) if peaks.size > 1 else np.array([])
+    heart_rate_time = peak_time[1:]
+    status_colors = {"PASS": "#22c55e", "REVIEW": "#f59e0b", "FAIL": "#ef4444"}
+    starts = np.asarray([row["start_s"] for row in rows])
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 10), sharex=True,
+        gridspec_kw={"height_ratios": [4, 2, 0.7]},
+    )
+
+    axes[0].plot(time[view], ecg[view], color="#1f77b4", linewidth=0.6, label="Filtered ECG")
+    axes[0].plot(peak_time, ecg[peaks], "ro", markersize=4, label="Refined R-peaks")
+    _shade_bad_runs(axes[0], artifact_summary["runs"])
+    axes[0].set(title="{} | ECG quality-control review".format(rid), ylabel="Filtered ECG")
+    axes[0].legend(loc="upper right", ncol=2)
+
+    if heart_rate.size:
+        axes[1].plot(
+            heart_rate_time, heart_rate, "o-", color="#2ca02c",
+            markersize=4, linewidth=1.5, label="Heart Rate (bpm)",
+        )
+    axes[1].axhspan(*cfg.ECG_PLAUSIBLE_HR_BPM, color="#22c55e", alpha=0.10, label="Plausible HR")
+    _shade_bad_runs(axes[1], artifact_summary["runs"])
+    axes[1].set(ylabel="Heart rate (bpm)")
+    finite_hr = heart_rate[np.isfinite(heart_rate)]
+    if finite_hr.size:
+        lower, upper = np.percentile(finite_hr, [1, 99])
+        padding = max(5.0, 0.15 * (upper - lower))
+        axes[1].set_ylim(max(0.0, lower - padding), upper + padding)
+    axes[1].legend(loc="upper right")
+
+    # 最后一个滑窗从 final_start 延伸到记录终点，而不只占一个步长。
+    widths = (np.array([row['end_s'] - row['start_s'] for row in rows])
+              if effective else np.full(starts.size, cfg.QC_STEP_SECONDS, dtype=float))
+    widths[-1] = ecg.size / sfreq - starts[-1]
+    axes[2].bar(
+        starts, 1, width=widths, align="edge",
+        color=[status_colors[row["status"]] for row in rows], linewidth=0,
+    )
+    axes[2].set(xlabel="Time (s)", ylabel="Effective QC" if effective else "Window QC", yticks=[])
+    if effective:
+        axes[0].set_title("{} | ECG after manual QC".format(rid))
+    axes[2].legend(
+        handles=[Patch(color=color, label=status) for status, color in status_colors.items()],
+        loc="upper right", ncol=3,
+    )
+
     for ax in axes:
-        ax.grid(True, alpha=0.25)
-    save_figure(fig, plot_dir("ecg", "02_qc") / "{}_window_qc.png".format(rid))
+        ax.grid(True, linestyle="--", alpha=0.6)
+    axes[0].set_xlim(0, ecg.size / sfreq)
+    save_figure(fig, plot_dir("ecg", "01_qc") / "{}_window_qc.png".format(rid))
 
 
 def run_ecg_qc():
-    input_dir = signal_dir("ecg") / "preprocessed"
+    """评估全部 ECG 预处理结果并生成记录级 QC 决策。"""
+    input_dir = output_path("ecg", "preprocessed")
     files = sorted(input_dir.glob("*.npz"))
     if not files:
         raise RuntimeError("没有ECG预处理结果，不能运行QC")
@@ -216,7 +342,9 @@ def run_ecg_qc():
                 "correctable_short_run": run["correctable"],
                 "severe_long_run": run["severe"],
             })
-        _qc_timeline(rows, rid)
+        _qc_plot(data, rows, artifact_summary, rid)
+
+        # 记录级判定：全窗通过则保留全段，否则寻找最长连续 PASS 区间。
         statuses = [row["status"] for row in rows]
         pass_fraction = statuses.count("PASS") / float(len(statuses))
         interval = longest_true_interval(
@@ -227,10 +355,15 @@ def run_ecg_qc():
         peak_count = int(data["primary_peaks"].size)
         if (pass_fraction >= cfg.ECG_MIN_PASS_WINDOW_FRACTION
                 and peak_count >= cfg.ECG_MIN_RPEAKS
-                and duration >= cfg.ECG_MIN_TIME_DOMAIN_SECONDS):
+                and duration >= cfg.minimum_valid_seconds('ecg', rid)):
             status, chosen, reason = "PASS", (0.0, duration), ""
-        elif interval and interval[1] - interval[0] >= cfg.ECG_MIN_TIME_DOMAIN_SECONDS:
+        elif interval and interval[1] - interval[0] >= cfg.minimum_valid_seconds('ecg', rid):
             status, chosen, reason = "TRIMMED", interval, "LONGEST_CONTINUOUS_PASS_INTERVAL"
+        # A record with no PASS window and at least one FAIL window is not a
+        # borderline record.  The previous ordering classified it as REVIEW
+        # merely because one overlapping window happened to be REVIEW.
+        elif statuses.count("PASS") == 0 and "FAIL" in statuses:
+            status, chosen, reason = "FAIL", interval, "NO_PASS_WINDOWS"
         elif "REVIEW" in statuses:
             status, chosen, reason = "REVIEW", interval, "BORDERLINE_WINDOWS"
         else:
@@ -241,16 +374,33 @@ def run_ecg_qc():
             "record_id": rid, "auto_status": status, "reason": reason,
             "analysis_start_s": start, "analysis_end_s": end, "usable_duration_s": usable,
             "pass_window_fraction": pass_fraction, "rpeak_count": peak_count,
+            "excellent_sqi_window_fraction": sum(
+                row["signal_quality"] == "Excellent" for row in rows
+            ) / float(len(rows)),
+            "borderline_sqi_window_count": sum(
+                row["signal_quality"] == "Barely acceptable" for row in rows
+            ),
+            "unacceptable_sqi_window_count": sum(
+                row["signal_quality"] == "Unacceptable" for row in rows
+            ),
             "detected_rpeak_count": int(data["initial_peaks"].size),
             "corrected_rpeak_count": peak_count,
             "short_bad_rr_count": artifact_summary["short_bad_count"],
             "short_bad_rr_fraction": artifact_summary["short_bad_fraction"],
             "longest_bad_run_s": artifact_summary["longest_bad_run_s"],
             "total_bad_duration_s": artifact_summary["total_bad_duration_s"],
-            "time_domain_eligible": usable >= cfg.ECG_MIN_TIME_DOMAIN_SECONDS,
-            "frequency_domain_eligible": usable >= cfg.ECG_MIN_FREQUENCY_DOMAIN_SECONDS,
+            "time_domain_eligible": usable >= cfg.minimum_valid_seconds('ecg', rid),
+            "standard_5min_hrv_eligible": usable >= cfg.ECG_STANDARD_HRV_SECONDS,
+            "frequency_domain_eligible": (
+                usable >= cfg.ECG_MIN_FREQUENCY_DOMAIN_SECONDS
+                and artifact_summary["short_bad_fraction"]
+                <= cfg.ECG_MAX_FREQUENCY_RR_CORRECTION_FRACTION
+            ),
         })
-    write_csv(window_rows, signal_dir("ecg") / "ecg_window_qc.csv")
-    write_csv(bad_run_rows, signal_dir("ecg") / "ecg_rr_bad_runs.csv")
-    write_csv(reports, signal_dir("ecg") / "ecg_qc_report.csv")
+    write_csv(window_rows, csv_path("ecg", "ecg_window_qc.csv"))
+    write_csv(bad_run_rows, csv_path("ecg", "ecg_rr_bad_runs.csv"))
+    write_csv(reports, csv_path("ecg", "ecg_qc_report.csv"))
+    save_qc_coverage_plot(
+        reports, "ecg", "01_qc", "ECG/HRV Coverage After Automatic Quality Control"
+    )
     return reports

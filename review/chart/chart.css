@@ -1,0 +1,11 @@
+body{margin:0;font-family:sans-serif}#plot{height:650px;position:relative}
+#preview{position:absolute;pointer-events:none;display:none;background:rgba(59,130,246,.12);border-left:2px dashed #2563eb;border-right:2px dashed #2563eb;z-index:20}
+#candidate{position:absolute;display:none;pointer-events:none;width:9px;height:9px;background:#ef4444;border:1px solid white;border-radius:50%;transform:translate(-50%,-50%);z-index:25}
+#menu{position:absolute;display:none;z-index:30;background:white;padding:8px;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 2px 8px #0002}
+#menu button{margin:3px;padding:6px 14px;cursor:pointer}#time{font-size:12px}
+#status{padding:8px 12px;color:#475569;font-size:13px;background:#f8fafc;border-radius:6px}
+#status[hidden]{display:none}
+button:focus-visible{outline:3px solid #2563eb;outline-offset:2px}
+#menu button{min-height:36px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#0f172a}
+#menu button[data-label="PASS"]{color:#166534;background:#f0fdf4}
+#menu button[data-label="FAIL"]{color:#991b1b;background:#fef2f2}

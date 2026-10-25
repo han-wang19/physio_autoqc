@@ -11,22 +11,64 @@ import project_config as cfg
 
 
 def experiment_dir():
+    """返回当前实验的输出根目录。"""
     return cfg.OUTPUT_ROOT / cfg.EXPERIMENT_NAME
 
 
 def signal_dir(signal):
+    """返回并创建 ECG 或 EDA 的输出目录。"""
     path = experiment_dir() / signal.lower()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def output_path(signal, name, root=None):
+    """Resolve ECG/EDA deliverables and internal storage consistently."""
+    root = Path(root) if root is not None else signal_dir(signal)
+    if signal in ('ecg', 'eda'):
+        if name in ('preprocessed', 'final', 'manual_rpeaks', 'excluded_artifacts'):
+            (root / 'internal').mkdir(parents=True, exist_ok=True)
+            return root / 'internal' / name
+        if name in ('reviewed_fif', 'final_ecg_hrv_features.csv',
+                    'ecg_valid_segments.csv', 'ecg_rr_intervals.csv', 'final_eda_features.csv'):
+            (root / 'results').mkdir(parents=True, exist_ok=True)
+            return root / 'results' / name
+    return root / name
+
+
 def plot_dir(signal, stage):
+    """返回并创建指定信号、指定阶段的图片目录。"""
     path = signal_dir(signal) / "plots" / stage
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+ECG_AUDIT_CSV = {
+    'ecg_preprocessing_report.csv', 'ecg_window_qc.csv', 'ecg_rr_bad_runs.csv',
+    'ecg_qc_report.csv', 'ecg_qc_effective_summary.csv',
+    'ecg_qc_effective_intervals.csv', 'final_ecg_processing_report.csv',
+}
+
+EDA_AUDIT_CSV = {'eda_preprocessing_report.csv', 'eda_window_qc.csv',
+                 'eda_qc_report.csv', 'eda_qc_effective_summary.csv',
+                 'eda_qc_effective_intervals.csv', 'final_eda_processing_report.csv'}
+
+
+def csv_path(signal, filename, experiment_root=None):
+    """Keep process reports in audit/, with legacy CSV read compatibility."""
+    root = (Path(experiment_root) / signal if experiment_root is not None else signal_dir(signal))
+    if (signal == 'ecg' and filename in ECG_AUDIT_CSV) or (signal == 'eda' and filename in EDA_AUDIT_CSV):
+        target = root / 'audit' / filename
+        legacy = root / filename
+        if legacy.exists() and not target.exists():
+            return legacy
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+    return root / filename
+
+
 def discover_files():
+    """按配置查找全部源 FIF 文件。"""
     if not cfg.DATA_DIR.is_dir():
         raise FileNotFoundError("数据目录不存在：{}".format(cfg.DATA_DIR))
     files = sorted(cfg.DATA_DIR.glob(cfg.FILE_PATTERN))
@@ -36,11 +78,13 @@ def discover_files():
 
 
 def record_id(path):
+    """从源文件名提取记录编号，如 A1_music1。"""
     suffix = "_physio_raw.fif"
     return path.name[:-len(suffix)] if path.name.endswith(suffix) else path.stem
 
 
 def save_figure(fig, path):
+    """按配置保存、显示并关闭 Matplotlib 图。"""
     if cfg.SAVE_PLOTS:
         path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path, dpi=cfg.PLOT_DPI, bbox_inches="tight", facecolor="white")
@@ -50,16 +94,19 @@ def save_figure(fig, path):
 
 
 def plot_indices(size, max_points=30000):
+    """为长信号生成等距抽样切片，仅用于降低绘图负担。"""
     step = max(1, int(np.ceil(size / float(max_points))))
     return slice(None, None, step)
 
 
 def write_csv(rows, path):
+    """将字典列表写为 Excel 兼容的 UTF-8 CSV。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def save_config_snapshot():
+    """保存本次运行的全部大写配置项。"""
     keys = [name for name in dir(cfg) if name.isupper()]
     values = {}
     for name in keys:
@@ -70,7 +117,7 @@ def save_config_snapshot():
     path = experiment_dir() / "config_snapshot.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(values, handle, ensure_ascii=False, indent=2)
+        json.dump(values, handle, ensure_ascii=False, indent=2, default=str)
     return path
 
 

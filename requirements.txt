@@ -1,5 +1,8 @@
 mne
 neurokit2
 numpy
+scipy
 pandas
 matplotlib
+plotly
+streamlit

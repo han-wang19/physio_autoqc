@@ -1,94 +1,125 @@
-# ECG/EDA 自动预处理与 QC
+# Physio AutoQC
 
-这是从现有 SC26CONC 代码中独立出的预处理工具。ECG 与 EDA 分开，预处理与 QC 也分开，总入口负责按顺序运行。
+用于 ECG / EDA 的本地科研流程：预处理、窗口质检、人工区间与 R 峰复核、审核后 FIF 导出，以及最终特征计算。使用 Python 3.10+。
 
-## 文件结构
+仓库只提供代码、方法说明和虚构格式示例，**不包含参与者数据、真实事件表、人工审核记录或研究结果**。运算和网页默认在使用者自己的电脑上运行。默认阈值需要结合自己的设备与实验验证。
 
-| 文件 | 内容 |
-|---|---|
-| `project_config.py` | 每次实验主要修改这里：数据路径、实验名、通道和阈值 |
-| `main.py` | 总入口 |
-| `ecg_preprocess.py` | ECG 读取、滤波、R 峰检测及阶段图 |
-| `ecg_qc.py` | ECG 窗口自动 QC、连续区间选择及 QC 图 |
-| `ecg_finalize.py` | 从源 FIF 裁取 QC 区间，重新处理并计算最终 HR/HRV |
-| `eda_preprocess.py` | EDA 重采样、清理、分解、SCR 检测及阶段图 |
-| `eda_qc.py` | EDA 窗口自动 QC、连续区间选择及 QC 图 |
-| `eda_finalize.py` | 从源 FIF 裁取 QC 区间，重新处理并计算最终 EDA 特征 |
-| `common.py` | 共用的文件与绘图辅助函数 |
+## 1. 安装
 
-## 使用
-
-先在 `project_config.py` 设置：
-
-```python
-EXPERIMENT_NAME = "SC26CONC"
-DATA_DIR = Path(r"E:\experiment_data\SC26CONC\physiology")
-FILE_PATTERN = "A*_music*_physio_raw.fif"
-ECG_CHANNEL = "ECG"
-EDA_CHANNEL = "GSR"
-```
-
-再运行：
+在项目根目录使用独立 Python 环境：
 
 ```powershell
-cd .\physio_autoqc
-python -m pip install -r .\requirements.txt
-python .\main.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-只处理一种信号时，把 `RUN_ECG` 或 `RUN_EDA` 设为 `False`。
+macOS / Linux 激活环境使用 `source .venv/bin/activate`。
 
-## ECG 流程
+## 2. 配置自己的实验
+
+复制公共模板为私人配置文件：
+
+```powershell
+Copy-Item project_config.example.json project_config.local.json
+```
+
+macOS / Linux 使用 `cp project_config.example.json project_config.local.json`。修改其中的实验名称、`DATA_DIR`、`FILE_PATTERN`、通道名、输入单位、设备量程和 `REVIEW_PORT`。不要把真实路径写回公共模板。
+
+相对路径相对于 JSON 所在目录。`PHYSIO_CONFIG` 可指定另一份私人 JSON，`PHYSIO_EXPERIMENT` 可选择默认实验。没有私人配置时，程序提供一个不含数据的 DEMO，预期来源目录为 `data/DEMO/physiology/`。
+
+私人配置和 `data/`、`outputs/` 均被 Git 忽略，不随代码提交。数据也可放在项目外部。完整字段见 [实验配置](docs/EXPERIMENTS.md)。
+
+### 输入文件约定
+
+每条源 FIF 应包含所配置的 ECG、GSR/EDA 通道，命名为：
 
 ```text
-源FIF → 0.5–40 Hz滤波和50 Hz陷波
-→ R峰检测和修正 → 滤波波形/R峰红点/心率图
-→ 30秒窗口自动QC → QC时间线
-→ PASS/REVIEW/TRIMMED/FAIL → 区间检查图
-→ 从源FIF重新裁剪、滤波和检测 → 最终HR/HRV和最终图
+A1_baseline_physio_raw.fif
+A1_task_physio_raw.fif
+A2_task_physio_raw.fif
 ```
 
-ECG QC 以 RR 合理比例、局部 RR 异常比例和坏段长度为主。最多连续 3 个且不超过 5 秒的短异常允许由峰修正流程处理；更长坏段不插值，而是分割后选择最长连续干净区间。信号平坦度、峰数和 QRS 模板相关作为保护或诊断信息。频域 HRV 资格单独要求至少 300 秒连续数据。
+`A<被试编号>_<条件>_physio_raw.fif` 中条件可自行命名，`music1` 等也支持。ECG 原生 FIF 应使用 MNE 的 V 单位；其他数值单位需在私人配置中明确指定。EDA 单位和设备范围需单独核对，不能根据幅值猜单位。
 
-## EDA 流程
+完整 BDF 与 CSV/TSV 时间表可先使用 [通道提取脚本](docs/EXPERIMENTS.md#从-bdf-和事件表提取)；该可选脚本目前要求来源通道名为 ECG/GSR。[examples/](examples/README.md) 只包含手工编写的格式示例。
 
-```text
-源FIF → 源采样率下记录缺失并插值 → 重采样到100 Hz
-→ NeuroKit清理 → tonic/phasic分解 → SCR检测和绝对幅度筛选
-→ 一张EDA预处理三联图
-→ 30秒窗口自动QC → QC时间线
-→ PASS/REVIEW/TRIMMED/FAIL → 区间检查图
-→ 从源FIF重新裁剪、清理、分解和检测 → 最终EDA特征和最终图
+### 使用完全合成的数据试运行
+
+不创建私人配置时：
+
+```powershell
+python scripts/make_demo_data.py
+python main.py --experiment DEMO --stage preprocess
+python main.py --experiment DEMO --stage qc
+python scripts/start_review.py --experiment DEMO
 ```
 
-现有 FIF 未保存设备到 µS 的校准，因此 EDA 幅度保持为 `source units`。
+生成的人工 FIF 位于被忽略的 `data/`；它只演示软件流程，不是算法有效性验证。已有私人配置时，可通过 `PHYSIO_CONFIG` 指向公共模板，并使用单独目录运行演示，避免混入自己的实验。
 
-## 输出
+## 3. 预处理与自动质检
+
+将 DEMO 换成 JSON 中登记的实验名称：
+
+```powershell
+python main.py --experiment DEMO --stage preprocess
+python main.py --experiment DEMO --stage qc
+```
+
+ECG 使用滤波、峰检测和统一的形态对齐；EDA 进行单位转换、清理、tonic/phasic 分解和 SCR 检测。自动 QC 生成 PASS、TRIMMED、REVIEW、FAIL。预处理失败会记录到报告并终止后续流程，修复原因后再重跑。
+
+默认最低有效时长为 120 秒。短基线可在私人配置中设置条件门槛，但不自动赋予标准 5 分钟或频域 HRV 资格，见 [QC 方法](docs/QC_METHODS.md)。
+
+<a id="manual-review"></a>
+
+## 4. 人工核查入口
+
+```powershell
+python scripts/start_review.py --experiment DEMO
+```
+
+终端会输出实验地址。示例配置为 **[http://127.0.0.1:8501](http://127.0.0.1:8501)**；保持终端运行，在同一页面左侧切换 ECG/EDA。页面顶部显示实验名称。可用 `--port 8510` 临时更换端口，按 `Ctrl+C` 停止服务。
+
+地址仅在服务启动时可用。`127.0.0.1` 只供本机访问；把代码放到 GitHub 不会自动提供远程审核服务。多个实验同时运行时应设置不同端口。
+
+审核步骤：选择记录 → 填写审阅者 → 标注 PASS/FAIL、编辑 R 峰 → 点击“完成审阅”。自动 PASS 也需要人工确认；人工完成状态与数据质量状态分开。
+
+- **完成审阅**：保存区间、峰和记录决定，并导出审核终版 FIF。
+- **结束本次审核并更新汇总**：同步最终特征、图片和有效汇总。人工暂定纳入仍可能被最终检查排除，原因见处理报告。
+
+## 5. 后续分析入口
 
 ```text
 outputs/<实验名称>/
 ├─ config_snapshot.json
+├─ manual_qc_decisions.csv、manual_qc_intervals.csv
 ├─ ecg/
-│  ├─ preprocessed/*.npz
-│  ├─ ecg_preprocessing_report.csv
-│  ├─ ecg_window_qc.csv
-│  ├─ ecg_rr_bad_runs.csv
-│  ├─ ecg_qc_report.csv
-│  ├─ final/*.npz
-│  ├─ final_ecg_hrv_features.csv
-│  ├─ final_ecg_processing_report.csv
-│  └─ plots/01_preprocess、02_qc、03_final/
-└─ eda/
-   ├─ preprocessed/*.npz
-   ├─ eda_preprocessing_report.csv
-   ├─ eda_window_qc.csv
-   ├─ eda_qc_report.csv
-   ├─ final/*.npz
-   ├─ final_eda_features.csv
-   ├─ final_eda_processing_report.csv
-   └─ plots/01_preprocess、02_qc、03_final/
+│  ├─ results/     reviewed_fif/、HRV 特征和 RR 表
+│  ├─ internal/    预处理、人工峰、最终 NPZ
+│  ├─ audit/       自动/有效 QC、最终处理报告
+│  └─ plots/       各阶段图片
+└─ eda/           同样分为 results、internal、audit、plots
 ```
 
-`config_snapshot.json` 保存本次运行设置。当前自动阈值是初始建议值，正式分析前仍需通过盲审样本校准并冻结版本。
+日常从 `results/` 开始。ECG 审核 FIF 只有一个 ECG 通道，R 峰为零时长 `R_PEAK` annotation；ECG/EDA 的不可用区间均合并为不重叠的 `BAD_segment`。保留区间存于元数据，不拼接坏段两侧的信号或 RR。
 
-每个 QC 指标的计算公式、阈值、判定顺序和已知限制见 `QC_METHODS.md`。
+审核 FIF 不表示已通过最终特征检查，现有流程是否纳入以 `audit/final_*_processing_report.csv` 为准。内部 NPZ 仍被程序依赖，不要随意删除。
+
+- [ECG FIF 读取示例](docs/ECG_FIF_USAGE.md)
+- [EDA FIF 读取示例](docs/EDA_FIF_USAGE.md)
+- [ECG CSV 列字典](docs/ECG_CSV_COLUMNS.md)
+- [单位与设备兼容](docs/ECG_UNIT_CHECK.md)
+
+也可运行 `python main.py --experiment DEMO --stage finalize`。默认 `--stage all` 连续预处理、QC 和最终计算，不等待人工审核，适合自动初筛。
+
+## 6. 开发与发布
+
+```powershell
+python -m unittest discover -s tests -q
+node --check review/chart/chart.js
+python scripts/check_public_files.py
+```
+
+Node 只用于可选的 JavaScript 语法检查，不是网页运行依赖。项目结构见 [维护说明](docs/PROJECT_STRUCTURE.md)，发布操作见 [GitHub 发布流程](docs/PUBLISHING.md)。科研方法与局限见 QC 方法文档。
+
+许可为 [MIT](LICENSE)，第三方库声明见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。测试环境及验证边界见 [验证说明](docs/VALIDATION.md)。

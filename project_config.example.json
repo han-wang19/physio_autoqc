@@ -1,0 +1,21 @@
+{
+  "default_experiment": "DEMO",
+  "output_root": "outputs",
+  "experiments": {
+    "DEMO": {
+      "DATA_DIR": "data/DEMO/physiology",
+      "FILE_PATTERN": "A*_*_physio_raw.fif",
+      "RAW_BDF_DIR": "data/DEMO/original_bdf",
+      "RAW_BDF_PATTERN": "sub-A{subject:02d}_eeg.bdf",
+      "ACQUISITION_SYSTEM": "generic",
+      "ECG_CHANNEL": "ECG",
+      "ECG_INPUT_UNIT": "auto",
+      "EDA_CHANNEL": "GSR",
+      "EDA_INPUT_UNIT": "uS",
+      "EDA_DEVICE_RANGE_US": [0, 100],
+      "EDA_CALIBRATION_SOURCE": "Replace with the unit/range source for your own device",
+      "MIN_VALID_SECONDS_BY_CONDITION": {},
+      "REVIEW_PORT": 8501
+    }
+  }
+}
