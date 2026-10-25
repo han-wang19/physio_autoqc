@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import project_config as cfg
+from reports.record_labels import natural_record_key
 
 from review.manual_qc import (
     INTERVAL_COLUMNS, read_manual_decisions, read_manual_intervals,
@@ -63,7 +64,7 @@ def run_review(load_report, load_record, load_windows, load_pass, ecg_figure,
         st.info('当前队列为空，请切换左侧筛选。')
         return
     statuses = candidate_statuses(report, completed)
-    rid = st.sidebar.selectbox('记录', choices.record_id.astype(str).tolist(),
+    rid = st.sidebar.selectbox('记录', sorted(choices.record_id.astype(str).tolist(), key=natural_record_key),
         format_func=lambda value: '{} | {} | {}'.format(value, statuses[value], '已人工审核' if value in reviewed else '待审核'))
     row = report[report.record_id.astype(str).eq(rid)].iloc[0]
     data = load_record(signal, rid)

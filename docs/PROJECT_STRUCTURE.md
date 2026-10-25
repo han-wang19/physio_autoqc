@@ -4,6 +4,7 @@
 
 | 路径 | 职责 |
 | --- | --- |
+| `app.py` | 日常统一入口：选择实验、预处理与质检、打开人工复核 |
 | `main.py`、`project_config.py` | 批处理入口与实验配置 |
 | `scripts/start_review.py` | 按实验名和固定端口启动人工核查网页 |
 | `scripts/extract_physio_channels.py` | 从切分 FIF 或 BDF/events.csv 提取双通道生理数据 |

@@ -2,6 +2,12 @@
 import re
 
 
+def natural_record_key(record_id):
+    """Order embedded numbers numerically without changing persistent identifiers."""
+    return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                 for part in re.split(r'(\d+)', str(record_id)))
+
+
 def record_parts(record_id):
     match = re.fullmatch(r'A([^_]+)_(.+)', str(record_id))
     if not match:
