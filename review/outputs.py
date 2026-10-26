@@ -3,57 +3,83 @@ from processing.common import output_path
 
 from processing.common import csv_path
 from pathlib import Path
+import hashlib
+import json
 
 import numpy as np
 import pandas as pd
 
 import project_config as cfg
 from processing.common import signal_dir
+from review.quality import effective_rows
+from reports.record_labels import natural_record_key
 
 
-def effective_rows(windows, manual, size, sfreq, signal, decision=None):
-    from review.manual_qc import consecutive_pass_window_runs, effective_manual_intervals
-    labels = np.full(size, 'REVIEW', dtype='<U6')
-
-    def paint(start, end, label):
-        left = max(0, int(np.floor(float(start) * sfreq)))
-        right = min(size, int(np.ceil(float(end) * sfreq)))
-        labels[left:right] = label
-
-    # PASS runs have the same precedence over overlapping bad windows as the UI.
-    for status in ('REVIEW', 'FAIL'):
-        for row in windows[windows.status.eq(status)].itertuples():
-            paint(row.start_s, row.end_s, status)
-    runs = (consecutive_pass_window_runs(windows) if signal == 'ecg' else
-            [(r.start_s, r.end_s) for r in windows[windows.status.eq('PASS')].itertuples()])
-    for start, end in runs:
-        paint(start, end, 'PASS')
-    for row in effective_manual_intervals(manual).itertuples():
-        paint(row.start_s, row.end_s, row.label)
-    # Completing an ECG review also accepts the record-level inclusion bounds.
-    # Resolve only residual REVIEW samples; retain the original quality evidence.
-    reason = str(getattr(decision, 'reason', ''))
-    completed = reason.startswith('REVIEW_COMPLETED') or reason == 'ACCEPTED_AUTOMATIC_RESULT'
-    status = str(getattr(decision, 'manual_status', ''))
-    if signal == 'ecg' and completed and status in ('INCLUDE_FULL', 'INCLUDE_TRIMMED', 'EXCLUDE'):
-        pending = labels == 'REVIEW'
-        if status == 'EXCLUDE':
-            labels[pending] = 'FAIL'
-        else:
-            start = float(decision.analysis_start_s)
-            end = float(decision.analysis_end_s)
-            if not np.isfinite(start) or not np.isfinite(end) or start >= end:
-                raise ValueError('Completed inclusion decision has invalid analysis bounds')
-            labels[pending] = 'FAIL'
-            left = max(0, int(np.floor(start * sfreq)))
-            right = min(size, int(np.ceil(end * sfreq)))
-            labels[left:right][pending[left:right]] = 'PASS'
-    bounds = np.r_[0, np.flatnonzero(labels[1:] != labels[:-1]) + 1, size]
-    return [dict(start_s=a / sfreq, end_s=b / sfreq, status=str(labels[a]))
-            for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+def _save_csv(table, path):
+    temporary = path.with_name(path.name + '.tmp')
+    table.to_csv(temporary, index=False, encoding='utf-8-sig')
+    temporary.replace(path)
 
 
-def save_effective_intervals(signal):
+def _processing_signature():
+    """Invalidate cached processing when scientific settings or code change."""
+    ignored = {'EXPERIMENTS', 'CONFIG_SOURCE', 'PROJECT_ROOT', 'OUTPUT_ROOT',
+               'DEFAULT_EXPERIMENT', 'REVIEW_PORT'}
+    settings = {key: getattr(cfg, key) for key in dir(cfg) if key.isupper() and key not in ignored}
+    digest = hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode())
+    for relative in ('processing/ecg_finalize.py', 'processing/ecg_preprocess.py',
+                     'processing/ecg_qc.py', 'processing/eda_finalize.py',
+                     'processing/eda_preprocess.py', 'processing/eda_qc.py',
+                     'processing/units.py', 'review/quality.py'):
+        path = cfg.PROJECT_ROOT / relative
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _record_signature(signal, item, windows, intervals, processing):
+    digest = hashlib.sha256(processing.encode())
+    digest.update(json.dumps([str(item.reviewed_at), str(item.manual_status),
+                             str(item.analysis_start_s), str(item.analysis_end_s)]).encode())
+    digest.update(windows.to_json(orient='records', double_precision=15).encode())
+    digest.update(intervals.to_json(orient='records', double_precision=15).encode())
+    root = signal_dir(signal)
+    inputs = [output_path(signal, 'preprocessed', root) / (item.record_id + '.npz'),
+              Path(cfg.DATA_DIR) / (item.record_id + '_physio_raw.fif')]
+    if signal == 'ecg':
+        inputs.append(output_path('ecg', 'manual_rpeaks', root) / (item.record_id + '.npz'))
+    for path in inputs:
+        state = (path.stat().st_size, path.stat().st_mtime_ns) if path.exists() else None
+        digest.update(json.dumps([str(path), state]).encode())
+    return digest.hexdigest()
+
+
+def _is_current(signal, item, previous, features, root, signature):
+    if previous is None or str(previous.get('manual_reviewed_at', '')) != str(item.reviewed_at):
+        return False
+    expected = {'INCLUDE_FULL': 'MANUAL_PASS', 'INCLUDE_TRIMMED': 'MANUAL_TRIMMED',
+                'EXCLUDE': 'MANUAL_EXCLUDE', 'SECOND_REVIEW': 'SECOND_REVIEW'}
+    if str(previous.get('qc_status', '')) != expected.get(item.manual_status):
+        return False
+    stored = previous.get('review_inputs_signature', '')
+    stored = '' if pd.isna(stored) else str(stored)
+    if stored and stored != signature:
+        return False
+    status = str(previous.get('processing_status', ''))
+    if status not in ('INCLUDED', 'NOT_INCLUDED', 'EXCLUDED_AFTER_FINAL_CHECK'):
+        return False
+    required = [output_path(signal, 'reviewed_fif', root) / (item.record_id + '_reviewed_raw.fif')]
+    if cfg.SAVE_PLOTS:
+        required.append(root / 'plots/01_qc' / (item.record_id + '_window_qc.png'))
+    if status == 'INCLUDED':
+        if not features.record_id.astype(str).eq(item.record_id).any():
+            return False
+        required.append(output_path(signal, 'final', root) / (item.record_id + '.npz'))
+        if cfg.SAVE_PLOTS:
+            required.append(root / 'plots/02_final' / (item.record_id + '_final.png'))
+    return all(path.exists() for path in required)
+
+
+def save_effective_intervals(signal, record_ids=None):
     """Export exact effective QC boundaries without replacing automatic window evidence."""
     from review.manual_qc import read_manual_intervals, read_manual_decisions
     root = signal_dir(signal)
@@ -61,6 +87,21 @@ def save_effective_intervals(signal):
     intervals = read_manual_intervals(signal)
     decisions = {str(row.record_id): row for row in read_manual_decisions().itertuples()
                  if str(row.signal) == signal}
+    target = csv_path(signal, '{}_qc_effective_intervals.csv'.format(signal))
+    previous = pd.DataFrame()
+    if (record_ids is not None and target.exists()
+            and target.stat().st_mtime_ns >= csv_path(signal, '{}_window_qc.csv'.format(signal)).stat().st_mtime_ns):
+        previous = pd.read_csv(target).fillna('')
+        if 'manual_reviewed_at' in previous:
+            missing = set(windows.record_id.astype(str)) - set(previous.record_id.astype(str))
+            saved_versions = previous.groupby('record_id').manual_reviewed_at.first().to_dict()
+            changed = {rid for rid, decision in decisions.items()
+                       if str(saved_versions.get(rid, '')) != str(decision.reviewed_at)}
+            selected = set(record_ids) | missing | changed
+            windows = windows[windows.record_id.astype(str).isin(selected)]
+            previous = previous[~previous.record_id.astype(str).isin(selected)]
+        else:
+            previous = pd.DataFrame()
     rows = []
     for rid, group in windows.groupby('record_id', sort=True):
         path = output_path(signal, 'preprocessed', root) / (str(rid) + '.npz')
@@ -71,36 +112,66 @@ def save_effective_intervals(signal):
             size = data['filtered' if signal == 'ecg' else 'clean'].size
         effective = effective_rows(group, intervals[intervals.record_id.eq(rid)], size, sfreq, signal,
                                    decisions.get(str(rid)))
-        rows.extend(dict(record_id=rid, **row) for row in effective)
-    pd.DataFrame(rows).to_csv(csv_path(signal, '{}_qc_effective_intervals.csv'.format(signal)),
-                             index=False, encoding='utf-8-sig')
+        version = str(getattr(decisions.get(str(rid)), 'reviewed_at', ''))
+        rows.extend(dict(record_id=rid, manual_reviewed_at=version, **row) for row in effective)
+    result = pd.concat([previous, pd.DataFrame(rows)], ignore_index=True)
+    _save_csv(result, target)
 
 
-def refresh_reviewed_outputs(signal):
+def refresh_reviewed_outputs(signal, progress=None, force=False):
     from review.manual_qc import (read_manual_decisions, read_manual_intervals,
                            read_effective_decisions, decision_is_included,
-                           load_manual_peak_times)
+                           load_manual_peak_times, mark_summary_dirty)
     manual = read_manual_decisions()
-    manual = manual[manual.signal.eq(signal)]
+    manual = manual[manual.signal.eq(signal) & (
+        manual.reason.astype(str).str.startswith('REVIEW_COMPLETED')
+        | manual.reason.eq('ACCEPTED_AUTOMATIC_RESULT'))]
     if manual.empty:
-        return
+        return dict(updated=0, skipped=0, record_ids=[])
     root = signal_dir(signal)
     windows = pd.read_csv(csv_path(signal, '{}_window_qc.csv'.format(signal)))
+    report_path = csv_path(signal, 'final_{}_processing_report.csv'.format(signal))
+    feature_path = output_path(signal, 'final_ecg_hrv_features.csv' if signal == 'ecg' else 'final_eda_features.csv', root)
+    reports = pd.read_csv(report_path).fillna('') if report_path.exists() else pd.DataFrame(columns=['record_id'])
+    features = pd.read_csv(feature_path) if feature_path.exists() else pd.DataFrame(columns=['record_id'])
+    intervals = read_manual_intervals(signal)
+    processing = _processing_signature()
+    pending = []
+    adopted = False
+    for item in sorted(manual.itertuples(), key=lambda row: natural_record_key(row.record_id)):
+        rid = str(item.record_id)
+        group = windows[windows.record_id.eq(rid)]
+        edits = intervals[intervals.record_id.eq(rid)]
+        signature = _record_signature(signal, item, group, edits, processing)
+        found = reports[reports.record_id.eq(rid)]
+        previous = found.iloc[-1] if not found.empty else None
+        if not force and _is_current(signal, item, previous, features, root, signature):
+            # Adopt existing per-record checkpoints from older versions without
+            # rerunning scientific processing just to add the signature column.
+            stored = previous.get('review_inputs_signature', '')
+            if pd.isna(stored) or not str(stored):
+                reports.loc[reports.record_id.eq(rid), 'review_inputs_signature'] = signature
+                adopted = True
+        else:
+            pending.append((item, signature))
+    if adopted:
+        _save_csv(reports, report_path)
+    skipped = len(manual) - len(pending)
+    if not pending:
+        return dict(updated=0, skipped=skipped, record_ids=[])
+    mark_summary_dirty(signal)
     if signal == 'ecg':
         from processing.ecg_qc import _qc_plot, _rr_artifact_summary
         from processing.ecg_finalize import finalize_one
     else:
         from processing.eda_qc import _qc_plot
         from processing.eda_finalize import finalize_one
-    report_path = csv_path(signal, 'final_{}_processing_report.csv'.format(signal))
-    feature_path = output_path(signal, 'final_ecg_hrv_features.csv' if signal == 'ecg' else 'final_eda_features.csv', root)
-    reports = pd.read_csv(report_path) if report_path.exists() else pd.DataFrame(columns=['record_id'])
-    features = pd.read_csv(feature_path) if feature_path.exists() else pd.DataFrame(columns=['record_id'])
     decisions = read_effective_decisions(signal)
-    for item in manual.itertuples():
+    completed = []
+    for index, (item, signature) in enumerate(pending):
         rid = str(item.record_id)
-        from review.fif_export import export_reviewed_signal
-        export_reviewed_signal(signal, rid)
+        if progress:
+            progress(signal, rid, index, len(pending), '更新 QC 图')
         print('Synchronizing {} {}'.format(signal, rid), flush=True)
         with np.load(output_path(signal, 'preprocessed', root) / (rid + '.npz')) as saved:
             data = {key: saved[key] for key in saved.files}
@@ -116,11 +187,17 @@ def refresh_reviewed_outputs(signal):
             _qc_plot(data, rows, _rr_artifact_summary(data['primary_peaks'], sfreq), rid, effective=True)
         else:
             _qc_plot(data, rows, rid, effective=True)
+        from review.fif_export import export_reviewed_signal
+        export_reviewed_signal(signal, rid, data=data,
+                               peaks=data['primary_peaks'] if signal == 'ecg' else None,
+                               decision=item, quality_rows=rows)
         decision = decisions[rid]
         report = dict(record_id=rid, qc_status=decision.auto_status,
                       processing_status='NOT_INCLUDED', reason='QC_NOT_PASS_OR_TRIMMED')
         feature = None
         if decision_is_included(decision):
+            if progress:
+                progress(signal, rid, index, len(pending), '计算最终特征')
             source = Path(cfg.DATA_DIR) / (rid + '_physio_raw.fif')
             if not source.exists():
                 raise FileNotFoundError(source)
@@ -140,11 +217,16 @@ def refresh_reviewed_outputs(signal):
                         archive = archive.with_name(archive.stem + '_' + str(pd.Timestamp.now().value) + archive.suffix)
                     old.replace(archive)
         report['manual_reviewed_at'] = str(item.reviewed_at)
+        report['review_inputs_signature'] = signature
         reports = pd.concat([reports[~reports.record_id.eq(rid)], pd.DataFrame([report])], ignore_index=True)
         features = features[~features.record_id.eq(rid)]
         if feature is not None:
             frame = feature if isinstance(feature, pd.DataFrame) else pd.DataFrame([feature])
             features = pd.concat([features, frame], ignore_index=True)
         # Persist each record so an interrupted session can safely be repeated.
-        reports.sort_values('record_id').to_csv(report_path, index=False, encoding='utf-8-sig')
-        features.sort_values('record_id').to_csv(feature_path, index=False, encoding='utf-8-sig')
+        _save_csv(features.sort_values('record_id'), feature_path)
+        _save_csv(reports.sort_values('record_id'), report_path)
+        completed.append(rid)
+        if progress:
+            progress(signal, rid, index + 1, len(pending), '已完成')
+    return dict(updated=len(completed), skipped=skipped, record_ids=completed)

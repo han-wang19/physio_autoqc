@@ -111,7 +111,7 @@ def plot_indices(signal, peaks, max_points=250_000):
     return np.unique(np.concatenate((envelope, tail, peak_neighborhood)))
 
 
-def rr_diagnostics(peaks, sfreq):
+def rr_diagnostics(peaks, sfreq, details=False):
     """返回瞬时心率及与自动 QC 规则一致的异常 RR 掩码。"""
     peak_times = peaks / sfreq
     rr_seconds = np.diff(peak_times)
@@ -126,8 +126,11 @@ def rr_diagnostics(peaks, sfreq):
         local_medians[index] = np.median(rr_seconds[left:right])
     deviation = np.abs(rr_seconds - local_medians) / np.maximum(local_medians, np.finfo(float).eps)
     low, high = cfg.ECG_PLAUSIBLE_HR_BPM
-    abnormal = (~np.isfinite(heart_rate)) | (heart_rate < low) | (heart_rate > high)
-    abnormal |= deviation > cfg.ECG_RR_LOCAL_DEVIATION
+    hr_flag = (~np.isfinite(heart_rate)) | (heart_rate < low) | (heart_rate > high)
+    deviation_flag = deviation > cfg.ECG_RR_LOCAL_DEVIATION
+    abnormal = hr_flag | deviation_flag
+    if details:
+        return peak_times, heart_rate, hr_flag, deviation_flag, local_medians, deviation
     return peak_times, heart_rate, abnormal
 
 
@@ -138,7 +141,9 @@ def ecg_figure(data, peaks, initial_start, initial_end, record_id, bad_windows,
     # The browser draws a pixel envelope from the full waveform for the current
     # viewport. Keep the initial overview small to avoid serializing it twice.
     samples = plot_indices(ecg, peaks, max_points=30_000)
-    peak_times, heart_rate, abnormal = rr_diagnostics(peaks, sfreq)
+    peak_times, heart_rate, hr_flag, deviation_flag, medians, deviation = rr_diagnostics(peaks, sfreq, details=True)
+    abnormal = hr_flag | deviation_flag
+    rr_details = np.column_stack((peak_times[:-1], peak_times[1:], np.diff(peak_times), medians, deviation * 100))
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -158,11 +163,21 @@ def ecg_figure(data, peaks, initial_start, initial_end, record_id, bad_windows,
         marker={"size": 4}, connectgaps=False,
         hovertemplate="%{x:.3f} s<br>%{y:.1f} bpm<extra></extra>",
     ), row=2, col=1)
-    fig.add_trace(go.Scattergl(
-        x=peak_times[1:][abnormal], y=heart_rate[abnormal], mode="markers",
-        name="Abnormal RR", marker={"color": "#dc2626", "size": 9, "symbol": "x"},
-        hovertemplate="异常 RR<br>%{x:.3f} s<br>%{y:.1f} bpm<extra></extra>",
-    ), row=2, col=1)
+    for name, mask, color, symbol, explanation in (
+        ('心率超限', hr_flag, '#dc2626', 'x',
+         '心率超出配置范围 {}–{} bpm'.format(*cfg.ECG_PLAUSIBLE_HR_BPM)),
+        ('RR 偏离提示', deviation_flag, '#d97706', 'circle-open',
+         'RR 相对偏离 > {:.0%}；请结合波形复核，不代表 R 峰错误'.format(cfg.ECG_RR_LOCAL_DEVIATION)),
+    ):
+        fig.add_trace(go.Scattergl(
+            x=peak_times[1:][mask], y=heart_rate[mask], mode='markers',
+            name=name, marker={'color': color, 'size': 10, 'symbol': symbol},
+            customdata=rr_details[mask],
+            hovertemplate=explanation + '<br>%{customdata[0]:.3f} → %{customdata[1]:.3f} s'
+                '<br>RR: %{customdata[2]:.3f} s；HR: %{y:.2f} bpm'
+                '<br>局部中位数: %{customdata[3]:.3f} s'
+                '<br>相对偏离: %{customdata[4]:.2f}%<extra></extra>',
+        ), row=2, col=1)
     low, high = cfg.ECG_PLAUSIBLE_HR_BPM
     for limit in (low, high):
         fig.add_hline(y=limit, line_color="#94a3b8", line_dash="dot", row=2, col=1)
@@ -185,13 +200,13 @@ def ecg_figure(data, peaks, initial_start, initial_end, record_id, bad_windows,
     fig.update_xaxes(title_text="Time (s)", range=[initial_start, initial_end], row=2, col=1)
     fig.update_xaxes(fixedrange=False, uirevision="ecg-time-{}".format(record_id))
     fig.update_layout(
-        height=650,
+        height=520,
         dragmode=drag_mode,
         clickmode="event+select",
         selectdirection="h",
         hovermode="x unified",
         margin={"t": 20, "b": 45},
-        uirevision="ecg-{}".format(record_id),
+        uirevision="ecg-{}-default60".format(record_id),
     )
     return fig, int(np.count_nonzero(abnormal)), int(heart_rate.size), int(samples.size)
 
@@ -262,8 +277,8 @@ def eda_figure(data, initial_start, initial_end, record_id, bad_windows,
     fig.update_xaxes(fixedrange=False, uirevision="eda-time-{}".format(record_id))
     fig.update_xaxes(title_text="Time (s)", range=[initial_start, initial_end], row=2, col=1)
     fig.update_layout(
-        height=650, dragmode=drag_mode, hovermode="x unified",
+        height=520, dragmode=drag_mode, hovermode="x unified",
         selectdirection="h",
-        margin={"t": 20, "b": 45}, uirevision="eda-{}".format(record_id),
+        margin={"t": 20, "b": 45}, uirevision="eda-{}-default60".format(record_id),
     )
     return fig

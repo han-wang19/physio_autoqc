@@ -12,6 +12,7 @@
 | `processing/common.py` | 文件路径、输出布局及公共辅助函数 |
 | `review_app.py` | Streamlit 启动、组件注册、页面级错误提示 |
 | `review/workflow.py` | 审核队列、筛选、草稿、撤销与保存流程 |
+| `review/quality.py` | 图中底色、人工完成状态和 FIF 导出共用的区间解析与纳入判定 |
 | `review/data.py` | 报告与 NPZ 读取、窗口状态整理；不依赖 Streamlit |
 | `review/figures.py` | ECG/EDA 图表、状态底色与人工边界；EDA 依赖按需加载 |
 | `review/manual_qc.py`、`review/outputs.py` | 人工决定持久化、有效结果及输出同步 |

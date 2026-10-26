@@ -73,7 +73,7 @@ def mark_summary_dirty(signal):
     _summary_dirty_path(signal).touch()
 
 
-def save_manual_intervals(signal, record_id, intervals):
+def save_manual_intervals(signal, record_id, intervals, *, derive=True):
     """Replace all interval annotations for one signal/record atomically."""
     path = intervals_path()
     if path.exists():
@@ -91,15 +91,9 @@ def save_manual_intervals(signal, record_id, intervals):
         table = table.sort_values(["signal", "record_id", "reviewed_at"], kind="stable")
     path.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False, encoding="utf-8-sig")
-    derive_record_decision_from_intervals(signal, record_id)
+    if derive:
+        derive_record_decision_from_intervals(signal, record_id)
     mark_summary_dirty(signal)
-
-
-def _true_intervals(mask, sfreq):
-    changes = np.diff(np.r_[False, np.asarray(mask, dtype=bool), False].astype(int))
-    starts = np.flatnonzero(changes == 1) / float(sfreq)
-    ends = np.flatnonzero(changes == -1) / float(sfreq)
-    return list(zip(starts, ends))
 
 
 def consecutive_pass_window_runs(windows):
@@ -118,14 +112,6 @@ def consecutive_pass_window_runs(windows):
     if run_start is not None:
         runs.append((run_start, run_end))
     return runs
-
-
-def _mark_consecutive_pass_window_runs(valid, windows, sfreq):
-    """Mark runs of consecutive PASS rows without bridging an intervening non-PASS row."""
-    for run_start, run_end in consecutive_pass_window_runs(windows):
-        left = max(0, int(np.floor(run_start * sfreq)))
-        right = min(valid.size, int(np.ceil(run_end * sfreq)))
-        valid[left:right] = True
 
 
 def derive_record_decision_from_intervals(signal, record_id):
@@ -151,66 +137,19 @@ def derive_record_decision_from_intervals(signal, record_id):
     with np.load(preprocessed) as data:
         sfreq = float(data["sfreq"])
         size = int(data["filtered"].size if signal.lower() == "ecg" else data["clean"].size)
-    duration = size / sfreq
     windows = pd.read_csv(windows_path, encoding="utf-8-sig")
     windows = windows[windows["record_id"].astype(str) == str(record_id)]
-    valid = np.zeros(size, dtype=bool)
     auto_report = pd.read_csv(csv_path(signal, "{}_qc_report.csv".format(signal)))
     found = auto_report[auto_report["record_id"].astype(str) == str(record_id)]
-    if signal.lower() == "ecg":
-        _mark_consecutive_pass_window_runs(valid, windows, sfreq)
-    else:
-        for item in windows.itertuples(index=False):
-            if str(item.status) != "PASS":
-                continue
-            left = max(0, int(np.floor(float(item.start_s) * sfreq)))
-            right = min(size, int(np.ceil(float(item.end_s) * sfreq)))
-            valid[left:right] = True
-
+    from review.quality import effective_rows, reviewed_disposition
+    resolved = effective_rows(windows, interval_table, size, sfreq, signal)
+    disposition = reviewed_disposition(signal, record_id, resolved, size, sfreq)
     interval_table = effective_manual_intervals(interval_table)
-    # Resolved intervals are disjoint; the latest annotation wins.
-    for label in ("PASS", "REVIEW", "FAIL"):
-        for item in interval_table[interval_table["label"].astype(str) == label].itertuples(index=False):
-            left = max(0, int(np.floor(float(item.start_s) * sfreq)))
-            right = min(size, int(np.ceil(float(item.end_s) * sfreq)))
-            valid[left:right] = label == "PASS"
-
-    if signal.lower() == "eda":
-        edge = int(round(cfg.EDA_EDGE_TRIM_SECONDS * sfreq))
-        valid[:edge] = False
-        valid[max(0, size - edge):] = False
-        usable = float(np.sum(valid) / sfreq)
-        full_start, full_end = cfg.EDA_EDGE_TRIM_SECONDS, max(
-            cfg.EDA_EDGE_TRIM_SECONDS, duration - cfg.EDA_EDGE_TRIM_SECONDS
-        )
-        full_mask = valid[edge:max(edge, size - edge)]
-        if full_mask.size and np.all(full_mask) and usable >= cfg.minimum_valid_seconds('eda', record_id):
-            manual_status, start, end = "INCLUDE_FULL", full_start, full_end
-        elif usable >= cfg.minimum_valid_seconds('eda', record_id):
-            manual_status, start, end = "INCLUDE_TRIMMED", full_start, full_end
-        elif np.any(interval_table["label"].astype(str) == "REVIEW"):
-            manual_status, start, end = "SECOND_REVIEW", np.nan, np.nan
-        else:
-            manual_status, start, end = "EXCLUDE", np.nan, np.nan
-    else:
-        candidates = _true_intervals(valid, sfreq)
-        longest = max(candidates, key=lambda pair: pair[1] - pair[0]) if candidates else None
-        usable = longest[1] - longest[0] if longest else 0.0
-        if valid.size and np.all(valid) and usable >= cfg.minimum_valid_seconds('ecg', record_id):
-            manual_status, start, end = "INCLUDE_FULL", 0.0, duration
-        elif longest and usable >= cfg.minimum_valid_seconds('ecg', record_id):
-            manual_status, start, end = "INCLUDE_TRIMMED", longest[0], longest[1]
-        elif np.any(interval_table["label"].astype(str) == "REVIEW"):
-            manual_status, start, end = "SECOND_REVIEW", np.nan, np.nan
-        else:
-            manual_status, start, end = "EXCLUDE", np.nan, np.nan
-
     auto_status = str(found.iloc[0].auto_status) if not found.empty else "MISSING_QC"
     reviewer_values = [str(value) for value in interval_table["reviewer"] if str(value).strip()]
     row = {
         "signal": signal, "record_id": record_id, "auto_status": auto_status,
-        "manual_status": manual_status, "analysis_start_s": start,
-        "analysis_end_s": end, "reviewer": reviewer_values[-1] if reviewer_values else "",
+        **disposition, "reviewer": reviewer_values[-1] if reviewer_values else "",
         "reason": "INTERVAL_ANNOTATIONS_DERIVED",
         "notes": "Derived automatically from manual interval annotations",
         "reviewed_at": pd.Timestamp.now().isoformat(timespec="seconds"),
@@ -243,13 +182,15 @@ def save_manual_decision(row):
     mark_summary_dirty(row["signal"])
 
 
-def refresh_manual_qc_summary(signal):
+def refresh_manual_qc_summary(signal, record_ids=None):
     """Write an effective record summary and coverage plot after manual edits."""
     report_path = csv_path(signal, "{}_qc_report.csv".format(signal))
     if not report_path.exists():
         return
+    dirty_path = _summary_dirty_path(signal)
+    dirty_stamp = dirty_path.stat().st_mtime_ns if dirty_path.exists() else None
     from review.outputs import save_effective_intervals
-    save_effective_intervals(signal)
+    save_effective_intervals(signal, record_ids=record_ids)
     if signal == 'ecg':
         from processing.ecg_analysis import export_ecg_analysis
         export_ecg_analysis()
@@ -302,17 +243,27 @@ def refresh_manual_qc_summary(signal):
         load_final_dispositions(experiment_dir(), signal), cfg.EXPERIMENT_NAME, signal,
         signal_dir(signal) / 'plots' / 'qc_summary' / 'subject_music_qc_coverage.png',
     )
-    _summary_dirty_path(signal).unlink(missing_ok=True)
+    if dirty_path.exists() and dirty_path.stat().st_mtime_ns == dirty_stamp:
+        dirty_path.unlink()
 
 
-def refresh_dirty_summaries(update_records=False):
+def refresh_dirty_summaries(update_records=False, progress=None):
     """Refresh deferred summaries, intended for an explicit finish or shutdown."""
+    stats = dict(updated=0, skipped=0, summaries=0)
     for signal in ("ecg", "eda"):
+        record_ids = None
+        if update_records:
+            from review.outputs import refresh_reviewed_outputs
+            result = refresh_reviewed_outputs(signal, progress=progress)
+            record_ids = result['record_ids']
+            stats['updated'] += result['updated']
+            stats['skipped'] += result['skipped']
         if _summary_dirty_path(signal).exists():
-            if update_records:
-                from review.outputs import refresh_reviewed_outputs
-                refresh_reviewed_outputs(signal)
-            refresh_manual_qc_summary(signal)
+            if progress:
+                progress(signal, '', 0, 0, '更新区间表与整体汇总图')
+            refresh_manual_qc_summary(signal, record_ids=record_ids)
+            stats['summaries'] += 1
+    return stats
 
 
 def peak_path(record_id):

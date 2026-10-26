@@ -27,7 +27,7 @@ function restoreViewport(layout,viewport){
   }
  });
 }
-const emit=value=>send('streamlit:setComponentValue',{value:{...value,viewport:currentViewport(),id:Date.now()+':'+(++seq)},dataType:'json'});
+const emit=value=>send('streamlit:setComponentValue',{value:{...value,record_id:args.record_id,signal:args.signal,viewport:currentViewport(),id:Date.now()+':'+(++seq)},dataType:'json'});
 function visibleWaveform(layout){
  const wave=args.waveform;
  if(args.signal!=='ecg'||!wave?.length)return null;
@@ -66,17 +66,21 @@ function editPeak(action,index){
  const peaks=action==='DELETE'?args.peaks.filter(p=>p!==index):[...new Set([...args.peaks,index])].sort((a,b)=>a-b);
  args.peaks=peaks;
  const times=peaks.map(p=>p/args.sfreq),rr=times.slice(1).map((t,i)=>t-times[i]);
- const hr=rr.map(t=>t>0?60/t:null),bad=[];
+ const hr=rr.map(t=>t>0?60/t:null),hrFlags=[],deviationFlags=[],details=[];
  const [low,high]=args.hr_limits||[40,180],limit=args.rr_deviation??0.2;
  rr.forEach((value,i)=>{
   const local=rr.slice(Math.max(0,i-2),i+3).sort((a,b)=>a-b),mid=Math.floor(local.length/2);
   const median=local.length%2?local[mid]:(local[mid-1]+local[mid])/2;
-  if(hr[i]===null||hr[i]<low||hr[i]>high||Math.abs(value-median)/Math.max(median,Number.EPSILON)>limit)bad.push(i);
+  const deviation=Math.abs(value-median)/Math.max(median,Number.EPSILON);
+  details.push([times[i],times[i+1],value,median,deviation*100]);
+  if(hr[i]===null||hr[i]<low||hr[i]>high)hrFlags.push(i);
+  if(deviation>limit)deviationFlags.push(i);
  });
  const updates={
   'R peaks':{x:times,y:peaks.map(p=>args.waveform[p])},
   'Heart rate':{x:times.slice(1),y:hr},
-  'Abnormal RR':{x:bad.map(i=>times[i+1]),y:bad.map(i=>hr[i])}
+  '心率超限':{x:hrFlags.map(i=>times[i+1]),y:hrFlags.map(i=>hr[i]),customdata:hrFlags.map(i=>details[i])},
+  'RR 偏离提示':{x:deviationFlags.map(i=>times[i+1]),y:deviationFlags.map(i=>hr[i]),customdata:deviationFlags.map(i=>details[i])}
  };
  // Update all dependent traces together, before the server reruns the page.
  const traces=plot.data.map(trace=>updates[trace.name]?{...trace,...updates[trace.name]}:trace);
@@ -212,7 +216,16 @@ async function renderLatest(){
    try{
  const viewport=plot._fullLayout?currentViewport():nextArgs.viewport;
  args=nextArgs;clearTimeout(clickTimer);cancel();rendering=true;
+ if(args.waveform_b64){
+  const binary=atob(args.waveform_b64),bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+  // Decode explicit little-endian float64 values without changing sample precision.
+  const view=new DataView(bytes.buffer),waveform=new Float64Array(bytes.length/8);
+  for(let i=0;i<waveform.length;i++)waveform[i]=view.getFloat64(i*8,true);
+  args.waveform=waveform;
+ }else args.waveform=args.waveform||[];
  const fig=JSON.parse(args.figure);fig.layout.clickmode='event';fig.layout.dragmode='pan';
+ plot.style.height=(fig.layout.height||520)+'px';
  restoreViewport(fig.layout,viewport);
  // Matched axes must start with the same range, including on the first render.
  if(!fig.layout.xaxis.range&&fig.layout.xaxis2?.range)fig.layout.xaxis.range=[...fig.layout.xaxis2.range];

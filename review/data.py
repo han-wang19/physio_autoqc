@@ -21,6 +21,14 @@ def load_record(signal, record_id):
         return {key: archive[key] for key in archive.files}
 
 
+def load_quality_rows(signal, record_id, size, sfreq, manual):
+    """Use the same resolved sample intervals for display and review decisions."""
+    from review.quality import effective_rows
+    windows = pd.read_csv(csv_path(signal, '{}_window_qc.csv'.format(signal)))
+    return effective_rows(windows[windows.record_id.astype(str).eq(str(record_id))],
+                          manual, size, sfreq, signal)
+
+
 def _merge_bad_windows(table):
     """把相邻/重叠的非 PASS 窗口合并为可读的伪迹事件。"""
     from collections import Counter, defaultdict
